@@ -201,7 +201,7 @@ local function startPlacing()
         while placing do
             local hrp = getHRP()
             local target = hrp.Position + (hrp.CFrame.LookVector * 4) + Vector3.new(0, -2, 0)
-            waitUntilCollected(5)
+            waitUntilCollected(1)
             placeBlockAt(target)
             task.wait(PLACE_DELAY)
         end
@@ -252,8 +252,12 @@ local function walkToTarget(targetPos)
     local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
     if not hrp or not humanoid then return end
 
-    local stepSize = 1
-    local tolerance = 4
+    -- ✅ New: Move the target slightly closer so you end up right next to it
+    local offsetDir = (targetPos - hrp.Position).Unit
+    targetPos = targetPos - (offsetDir * 1.5) -- move 1.5 studs closer to the object
+
+    local stepSize = 2
+    local tolerance = 0.2 -- ✅ much smaller tolerance so we stand very close
 
     while harvesting and (hrp.Position - targetPos).Magnitude > tolerance do
         -- Move toward target in 3D, but dampen Y so you don’t dive into blocks
@@ -267,6 +271,7 @@ local function walkToTarget(targetPos)
 
     humanoid:Move(Vector3.zero)
 end
+
 
 
 
@@ -338,11 +343,16 @@ end
 local function harvestTree(tree)
     if not harvesting or not tree then return end
 
-    -- walk close to trunk
-    local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChildWhichIsA("BasePart")
-    if trunk then
-        walkToTarget(trunk.Position)
-    end
+    -- walk almost on top of trunk
+local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChildWhichIsA("BasePart")
+if trunk then
+    -- Move the target slightly inside the tree so we stand right next to it
+    local hrp = getHRP()
+    local towardTrunk = (trunk.Position - hrp.Position).Unit
+    local closeTarget = trunk.Position - (towardTrunk * 2) -- go 0.5 studs *inside* tree
+    walkToTarget(closeTarget)
+end
+
 
     -- punch until tree is gone
     while harvesting and tree.Parent do
@@ -357,7 +367,7 @@ local function harvestTree(tree)
     end
 
     -- then use your existing collect wait
-    waitUntilCollected(1)
+    waitUntilCollected(.3)
 end
 
 
@@ -373,7 +383,7 @@ local function startHarvesting()
                 harvestTree(tree)
             else
                 statusLabel.Text = "⏳ Waiting for trees..."
-                task.wait(1)
+                task.wait(.3)
             end
         end
     end)
