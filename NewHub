@@ -1,0 +1,1152 @@
+-- 🌟 Tqcticals Hub 🌟
+
+-- === Services ===
+local player = game.Players.LocalPlayer
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+
+-- === Remotes ===
+local Events = RS:WaitForChild("Events")
+local PunchBlock = Events:WaitForChild("PunchBlock")
+local RequestPlaceBlock = Events:WaitForChild("RequestPlaceBlock")
+local RequestDrop = Events:WaitForChild("RequestDrop")
+local autoDropping = false
+local autoDropTask = nil
+
+-- === Files ===
+local BREAKABLE_FILE   = "BlocktopiaBreakables.json"
+local PLACE_FILE       = "BlocktopiaPlaceBlock.txt"
+local PLACE_LIST_FILE  = "BlocktopiaPlaceBlocks.json"
+local WALKSPEED_FILE   = "BlocktopiaWalkSpeed.txt"
+local MODS_FILE        = "BlocktopiaMods.json"
+
+-- === Settings ===
+local PLACE_BLOCK = "Red Block"
+local LOOP_DELAY  = 0
+local PLACE_DELAY = 0.3
+local MAX_RANGE   = 5
+local DEFAULT_WALKSPEED = 21
+local walkSpeed = DEFAULT_WALKSPEED
+
+-- === State ===
+local farming, placing, collecting = false, false, false
+local farmingTask, placingTask, collectorTask = nil, nil, nil
+local statusLabel
+local harvesting = false
+local harvestingTask = nil
+
+-- === Inventory ===
+local LastSelectedItem = player:WaitForChild("LastSelectedItem")
+
+-- === Breakables + Place Blocks ===
+local breakable = {
+    ["Dirt"]=true,["Stone"]=true,["Rock"]=true,
+    ["Cave Background"]=true,["Lava"]=true,["Grass"]=true,["Sand"]=true,
+    ["Wooden Background"]=true,
+}
+local placeBlockList = {"Red Block","Stone","Wood","Grass"}
+
+-- === Safe call ===
+local function callServer(remote, ...)
+    if not remote then return false end
+    local args = {...}
+    if remote.ClassName == "RemoteEvent" then
+        return pcall(function() remote:FireServer(unpack(args)) end)
+    elseif remote.ClassName == "RemoteFunction" then
+        return pcall(function() return remote:InvokeServer(unpack(args)) end)
+    end
+end
+
+-- === Persistence: load ===
+if isfile and isfile(WALKSPEED_FILE) then
+    local ok, data = pcall(function() return tonumber(readfile(WALKSPEED_FILE)) end)
+    if ok and data then walkSpeed = data end
+end
+if isfile and isfile(BREAKABLE_FILE) then
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(BREAKABLE_FILE)) end)
+    if ok and type(data)=="table" then for k,v in pairs(data) do breakable[k]=v end end
+end
+if isfile and isfile(PLACE_FILE) then
+    local ok, data = pcall(function() return readfile(PLACE_FILE) end)
+    if ok and data~="" then PLACE_BLOCK = data end
+end
+if isfile and isfile(PLACE_LIST_FILE) then
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(PLACE_LIST_FILE)) end)
+    if ok and type(data)=="table" then placeBlockList=data end
+end
+
+-- === Persistence: save helpers ===
+local function saveWalkSpeed() if writefile then writefile(WALKSPEED_FILE, tostring(walkSpeed)) end end
+local function saveBreakables()
+    if writefile then
+        local ok, data = pcall(function() return HttpService:JSONEncode(breakable) end)
+        if ok then writefile(BREAKABLE_FILE, data) end
+    end
+end
+local function savePlaceBlock() if writefile then writefile(PLACE_FILE, PLACE_BLOCK) end end
+local function savePlaceBlockList()
+    if writefile then
+        local ok, data = pcall(function() return HttpService:JSONEncode(placeBlockList) end)
+        if ok then writefile(PLACE_LIST_FILE, data) end
+    end
+end
+
+-- === Helpers ===
+local function getHRP()
+    return (player.Character or player.CharacterAdded:Wait()):WaitForChild("HumanoidRootPart")
+end
+local function rayModel(dir)
+    local hrp = getHRP()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {player.Character}
+    local r = Workspace:Raycast(hrp.Position, dir * 4, params)
+    if not r then return nil end
+    local model = r.Instance:FindFirstAncestorOfClass("Model")
+    return model or r.Instance
+end
+
+-- === FARM LOOP (mobile safe) ===
+local function startFarming()
+    if farmingTask then return end
+    farming = true
+    statusLabel.Text = "🌱 Auto Farming..."
+    farmingTask = task.spawn(function()
+        while farming do
+            for _, dir in ipairs({
+                Vector3.new(1, 0, 0),
+                Vector3.new(-1, 0, 0),
+                Vector3.new(0, 0, 1),
+                Vector3.new(0, 0, -1),
+            }) do
+                local m = rayModel(dir)
+                if m and breakable[m.Name] then
+                    pcall(function() callServer(PunchBlock, m) end)
+                    task.wait(0) -- throttle on mobile
+                end
+            end
+            task.wait(math.max(LOOP_DELAY, 0)) -- always yield
+        end
+    end)
+end
+local function stopFarming()
+    farming=false
+    farmingTask=nil
+    statusLabel.Text="Ready"
+end
+
+-- === PLACE HELPERS ===
+local function placeBlockAt(pos)
+    if LastSelectedItem then
+        pcall(function() LastSelectedItem.Value = PLACE_BLOCK end)
+    end
+    local best, bestDist = nil, math.huge
+    for _, m in ipairs(Workspace:GetDescendants()) do
+        if m:IsA("Model") and m.Name == "Air" then
+            local p = m:FindFirstChild("SavePositionPart") or m:FindFirstChildWhichIsA("BasePart")
+            if p then
+                local d = (p.Position - pos).Magnitude
+                if d < bestDist and d < 6 then
+                    best, bestDist = m, d
+                end
+            end
+        end
+    end
+    if best then pcall(function() callServer(RequestPlaceBlock, best, PLACE_BLOCK) end) end
+end
+
+-- === Wait for nearby drops (shortened + mobile safe) ===
+local function waitUntilCollected(timeout)
+    local hrp = getHRP()
+    local start = tick()
+
+    local function getNearbyDrops()
+        local drops = {}
+        for _, containerName in ipairs({"FloatingObjects", "FloatingGems"}) do
+            local container = Workspace:FindFirstChild(containerName)
+            if container then
+                for _, obj in ipairs(container:GetChildren()) do
+                    local part = obj:FindFirstChild("DroppedPart") or obj:FindFirstChildWhichIsA("BasePart")
+                    if part and (part.Position - hrp.Position).Magnitude < 15 then
+                        table.insert(drops, {model = obj, part = part})
+                    end
+                end
+            end
+        end
+        return drops
+    end
+
+    task.wait(0.1)
+    local first = getNearbyDrops()
+    if #first == 0 then
+        statusLabel.Text = "Ready"
+        return true
+    end
+
+    statusLabel.Text = "⏸️ Waiting for drops..."
+    local lastHad = tick()
+    while tick() - start < timeout do
+        local drops = getNearbyDrops()
+        if #drops == 0 then
+            if tick() - lastHad > 0.2 then break end
+        else
+            lastHad = tick()
+            for _, drop in ipairs(drops) do
+                pcall(function()
+                    callServer(RequestDrop, drop.model, 1)
+                    firetouchinterest(hrp, drop.part, 0)
+                    firetouchinterest(hrp, drop.part, 1)
+                end)
+            end
+        end
+        task.wait(0.1)
+    end
+    statusLabel.Text = "Ready"
+    return true
+end
+
+-- === PLACE LOOP (mobile safe) ===
+local function startPlacing()
+    if placingTask then return end
+    placing = true
+    statusLabel.Text = "🧱 Auto Placing..."
+    placingTask = task.spawn(function()
+        while placing do
+            local hrp = getHRP()
+            local target = hrp.Position + (hrp.CFrame.LookVector * 4) + Vector3.new(0, -2, 0)
+            waitUntilCollected(1) -- shortened from 5s
+            placeBlockAt(target)
+            task.wait(math.max(PLACE_DELAY, 0.1))
+        end
+    end)
+end
+local function stopPlacing()
+    placing=false
+    placingTask=nil
+    statusLabel.Text="Ready"
+end
+
+-- === COLLECT LOOP (mobile safe) ===
+local function sweepCollect()
+    local hrp = getHRP()
+    for _,containerName in ipairs({"FloatingObjects","FloatingGems"}) do
+        local container = Workspace:FindFirstChild(containerName)
+        if container then
+            for _,obj in ipairs(container:GetChildren()) do
+                local part=obj:FindFirstChild("DroppedPart") or obj:FindFirstChildWhichIsA("BasePart")
+                if part and (part.Position-hrp.Position).Magnitude<=MAX_RANGE then
+                    pcall(function()
+                        callServer(RequestDrop,obj,1)
+                        firetouchinterest(hrp,part,0)
+                        firetouchinterest(hrp,part,1)
+                    end)
+                end
+            end
+        end
+    end
+end
+local function startCollecting()
+    if collectorTask then return end
+    collecting = true
+    statusLabel.Text = "✨ Auto Collecting..."
+    collectorTask = task.spawn(function()
+        while collecting do
+            sweepCollect()
+            task.wait(0.1) -- was 0.02
+        end
+    end)
+end
+local function stopCollecting()
+    collecting=false
+    collectorTask=nil
+    statusLabel.Text="Ready"
+end
+
+-- === WALK / TREES (harvest) ===
+local function walkToTarget(targetPos)
+    local hrp = getHRP()
+    local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    if not hrp or not humanoid then return end
+
+    local stepSize = 1
+    local tolerance = 4
+
+    while harvesting and (hrp.Position - targetPos).Magnitude > tolerance do
+        local dir = (targetPos - hrp.Position).Unit
+        local moveStep = Vector3.new(dir.X, dir.Y * 0.3, dir.Z)
+        hrp.CFrame = CFrame.new(hrp.Position + moveStep * stepSize, targetPos)
+        humanoid:Move(Vector3.new(dir.X, 0, dir.Z))
+        task.wait(0.1)
+    end
+    humanoid:Move(Vector3.zero)
+end
+
+
+local function getNearestTree()
+    local hrp = getHRP()
+    local nearest, dist = nil, math.huge
+    local yTolerance = 2
+
+    local wb = workspace:FindFirstChild("WorldBlocks")
+    if not wb then return nil end
+
+    for _, tree in ipairs(wb:GetChildren()) do
+        if tree.Name:lower():find("tree") then
+            local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChildWhichIsA("BasePart")
+            if trunk then
+                local horizontalDist = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(trunk.Position.X, 0, trunk.Position.Z)).Magnitude
+                local yDiff = math.abs(hrp.Position.Y - trunk.Position.Y)
+                if yDiff <= yTolerance and horizontalDist < dist then
+                    dist = horizontalDist
+                    nearest = tree
+                end
+            end
+        end
+    end
+
+    if not nearest then
+        for _, tree in ipairs(wb:GetChildren()) do
+            if tree.Name:lower():find("tree") then
+                local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChildWhichIsA("BasePart")
+                if trunk then
+                    local d = (hrp.Position - trunk.Position).Magnitude
+                    if d < dist then
+                        dist = d
+                        nearest = tree
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function getNearestDrop()
+    local hrp = getHRP()
+    local nearest, dist = nil, math.huge
+    for _, containerName in ipairs({"FloatingObjects","FloatingGems"}) do
+        local container = Workspace:FindFirstChild(containerName)
+        if container then
+            for _, drop in ipairs(container:GetChildren()) do
+                local part = drop:FindFirstChild("DroppedPart") or drop:FindFirstChildWhichIsA("BasePart")
+                if part then
+                    local d = (hrp.Position - part.Position).Magnitude
+                    if d < dist then
+                        dist = d
+                        nearest = part
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function harvestTree(tree)
+    if not harvesting or not tree then return end
+    local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChildWhichIsA("BasePart")
+    if trunk then
+        walkToTarget(trunk.Position)
+    end
+    while harvesting and tree.Parent do
+        pcall(function() callServer(PunchBlock, tree) end)
+        task.wait(0.5)
+    end
+    local drop = getNearestDrop()
+    if drop then walkToTarget(drop.Position) end
+    waitUntilCollected(.5)
+end
+
+local function startHarvesting()
+    if harvestingTask then return end
+    harvesting = true
+    statusLabel.Text = "🌳 Auto Tree Harvesting..."
+    harvestingTask = task.spawn(function()
+        while harvesting do
+            local tree = getNearestTree()
+            if tree then
+                harvestTree(tree)
+            else
+                statusLabel.Text = "⏳ Waiting for trees..."
+                task.wait(1)
+            end
+        end
+    end)
+end
+
+local function stopHarvesting()
+    harvesting = false
+    if harvestingTask then
+        task.cancel(harvestingTask)
+        harvestingTask = nil
+    end
+    statusLabel.Text = "Ready"
+end
+
+-- === MOD DETECTION ===
+local modDetectionEnabled = false
+local knownMods = { } -- will be loaded from file
+
+if isfile and isfile(MODS_FILE) then
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(MODS_FILE)) end)
+    if ok and type(data)=="table" then
+        for name, v in pairs(data) do
+            if type(name)=="string" and (v==true) then
+                knownMods[name]=true
+            end
+        end
+    end
+end
+local function saveMods()
+    if writefile then
+        local ok, data = pcall(function() return HttpService:JSONEncode(knownMods) end)
+        if ok then writefile(MODS_FILE, data) end
+    end
+end
+
+local function leaveOnDetect(modName)
+    statusLabel.Text = "⚠️ Mod detected ("..tostring(modName)..") — leaving..."
+    task.wait(0.35)
+    pcall(function() player:Kick("Mod detected in server: "..tostring(modName)) end)
+end
+
+local function rescanPlayersForMods()
+    if not modDetectionEnabled then return end
+    for _, p in ipairs(game.Players:GetPlayers()) do
+        if knownMods[p.Name] then
+            leaveOnDetect(p.Name)
+            return
+        end
+    end
+end
+
+game.Players.PlayerAdded:Connect(function(newPlayer)
+    if modDetectionEnabled and knownMods[newPlayer.Name] then
+        leaveOnDetect(newPlayer.Name)
+    end
+end)
+
+
+-- Function to drop an item
+local function dropItemByName(itemName, amount)
+    if LastSelectedItem then
+        LastSelectedItem.Value = itemName
+    end
+
+    -- Use provided amount (fallback 1 if empty/invalid)
+    local dropAmount = tonumber(amount) or 1
+    local ok = callServer(RequestDrop, itemName, dropAmount)
+
+    if ok then
+        statusLabel.Text = "🗑️ Dropped " .. dropAmount .. " of: " .. itemName
+    else
+        statusLabel.Text = "⚠️ Couldn’t drop: " .. itemName
+    end
+end
+
+
+
+
+
+-- === GUI ===
+local gui = Instance.new("ScreenGui")
+gui.Name="Tqcticals Hub"
+gui.ResetOnSpawn=false
+gui.Parent = CoreGui
+
+local mainFrame=Instance.new("Frame")
+mainFrame.Size=UDim2.new(0,665,0,600)
+mainFrame.Position=UDim2.new(0.2,0,0.2,0)
+mainFrame.BackgroundColor3=Color3.fromRGB(19,19,22)
+Instance.new("UICorner",mainFrame).CornerRadius=UDim.new(0,10)
+mainFrame.Parent=gui
+
+-- Title Bar
+local titleBar=Instance.new("Frame")
+titleBar.Size=UDim2.new(1,0,0,42)
+titleBar.BackgroundColor3=Color3.fromRGB(28,28,32)
+Instance.new("UICorner",titleBar).CornerRadius=UDim.new(0,10)
+titleBar.Parent=mainFrame
+
+local titleText=Instance.new("TextLabel")
+titleText.BackgroundTransparency=1
+titleText.Size=UDim2.new(1,-80,1,0)
+titleText.Position=UDim2.new(0,10,0,0)
+titleText.Text="Tqcticals Hub Hub"
+titleText.TextColor3=Color3.fromRGB(230,230,235)
+titleText.Font=Enum.Font.GothamBold
+titleText.TextSize=16
+titleText.TextXAlignment=Enum.TextXAlignment.Left
+titleText.Parent=titleBar
+
+-- Minimize button
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Text = "–"
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 20
+minimizeBtn.TextColor3 = Color3.fromRGB(235,235,240)
+minimizeBtn.BackgroundTransparency = 1
+minimizeBtn.Size = UDim2.new(0,30,1,0)
+minimizeBtn.Position = UDim2.new(1,-34,0,0)
+minimizeBtn.Parent = titleBar
+
+-- Sidebar + Content
+local sidebar=Instance.new("Frame")
+sidebar.Size=UDim2.new(0,60,1,-42)
+sidebar.Position=UDim2.new(0,0,0,42)
+sidebar.BackgroundColor3=Color3.fromRGB(16,16,20)
+Instance.new("UICorner",sidebar).CornerRadius=UDim.new(0,10)
+sidebar.Parent=mainFrame
+
+local content=Instance.new("Frame")
+content.Size=UDim2.new(1,-60,1,-42)
+content.Position=UDim2.new(0,60,0,42)
+content.BackgroundColor3=Color3.fromRGB(23,23,27)
+Instance.new("UICorner",content).CornerRadius=UDim.new(0,10)
+content.Parent=mainFrame
+
+local function createPage(name)
+    local page=Instance.new("Frame")
+    page.BackgroundTransparency=1
+    page.Visible=false
+    page.Size=UDim2.new(1,0,1,0)
+    page.Name=name
+    page.Parent=content
+    return page
+end
+local function showPage(name)
+    for _,pg in pairs(content:GetChildren()) do
+        if pg:IsA("Frame") then pg.Visible=(pg.Name==name) end
+    end
+end
+
+local mainPage=createPage("Main")
+local blocksPage=createPage("Blocks")
+local settingsPage=createPage("Settings")
+settingsPage.ClipsDescendants = true
+
+-- Tabs
+local function tab(iconId,order,pageName)
+    local b=Instance.new("ImageButton")
+    b.BackgroundTransparency=1
+    b.Image=iconId
+    b.Size=UDim2.new(0,28,0,28)
+    b.Position = UDim2.new(0.5, -14, 0, 18 + (order - 1) * 48)
+    b.Parent=sidebar
+    b.MouseButton1Click:Connect(function() showPage(pageName) end)
+end
+tab("rbxassetid://6031094678",1,"Main")
+tab("rbxassetid://6031265976",2,"Blocks")
+tab("rbxassetid://6031094679",3,"Settings")
+
+-- Pill helpers
+local function pill(parent,y,text)
+    local row=Instance.new("TextButton")
+    row.Text=text
+    row.Font=Enum.Font.Gotham
+    row.TextSize=16
+    row.TextColor3=Color3.fromRGB(235,235,240)
+    row.BackgroundColor3=Color3.fromRGB(70,70,75)
+    row.BorderSizePixel=0
+    row.Size=UDim2.new(1,-32,0,44)
+    row.Position=UDim2.new(0,16,0,y)
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,10)
+    row.Parent=parent
+    return row
+end
+local function pillInput(parent,size,pos,placeholder)
+    local box=Instance.new("TextBox")
+    box.Text=""
+    box.PlaceholderText = placeholder
+    box.Font=Enum.Font.Gotham
+    box.TextSize=16
+    box.TextColor3=Color3.fromRGB(235,235,240)
+    box.BackgroundColor3=Color3.fromRGB(60,60,65)
+    box.BorderSizePixel=0
+    box.Size=size
+    box.Position=pos
+    Instance.new("UICorner",box).CornerRadius=UDim.new(0,10)
+    box.Parent=parent
+    return box
+end
+local function pillButton(parent,size,pos,text)
+    local btn = Instance.new("TextButton")
+    btn.Text = text
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 16
+    btn.TextColor3 = Color3.fromRGB(235,235,240)
+    btn.BackgroundColor3 = Color3.fromRGB(50,50,55) -- darker than normal pills
+    btn.BorderSizePixel = 0
+    btn.Size = size
+    btn.Position = pos
+    Instance.new("UICorner",btn).CornerRadius = UDim.new(0,10)
+    btn.Parent = parent
+
+    -- Optional: hover effect
+    btn.MouseEnter:Connect(function()
+        btn.BackgroundColor3 = Color3.fromRGB(40,40,45)
+    end)
+    btn.MouseLeave:Connect(function()
+        btn.BackgroundColor3 = Color3.fromRGB(50,50,55)
+    end)
+
+    return btn
+end
+
+
+-- === MAIN PAGE ===
+local farmToggle=pill(mainPage,14,"Auto Farm")
+farmToggle.MouseButton1Click:Connect(function()
+    if farming then
+        stopFarming()
+        farmToggle.BackgroundColor3=Color3.fromRGB(70,70,75)
+    else
+        startFarming()
+        farmToggle.BackgroundColor3=Color3.fromRGB(60,180,90)
+    end
+end)
+
+local placeToggle=pill(mainPage,68,"Auto Place")
+placeToggle.MouseButton1Click:Connect(function()
+    if placing then
+        stopPlacing()
+        placeToggle.BackgroundColor3=Color3.fromRGB(70,70,75)
+    else
+        startPlacing()
+        placeToggle.BackgroundColor3=Color3.fromRGB(60,180,90)
+    end
+end)
+
+local collectToggle=pill(mainPage,122,"Auto Collect")
+collectToggle.MouseButton1Click:Connect(function()
+    if collecting then
+        stopCollecting()
+        collectToggle.BackgroundColor3=Color3.fromRGB(70,70,75)
+    else
+        startCollecting()
+        collectToggle.BackgroundColor3=Color3.fromRGB(60,180,90)
+    end
+end)
+
+local statusPill = pill(mainPage,176,"Status: Ready")
+statusLabel = statusPill
+
+local harvestToggle = pill(mainPage, 230, "Auto Tree Harvest")
+harvestToggle.MouseButton1Click:Connect(function()
+    if harvesting then
+        stopHarvesting()
+        harvestToggle.BackgroundColor3 = Color3.fromRGB(70,70,75)
+    else
+        startHarvesting()
+        harvestToggle.BackgroundColor3 = Color3.fromRGB(60,180,90)
+    end
+end)
+
+
+
+
+-- === BLOCKS PAGE ===
+local brInput = pillInput(blocksPage, UDim2.new(0,230,0,44), UDim2.new(0,16,0,14), "Enter breakable name...")
+local brAdd   = pillButton(blocksPage, UDim2.new(0,160,0,44), UDim2.new(0,262,0,14), "Add Breakable")
+brAdd.MouseButton1Click:Connect(function()
+    if brInput.Text~="" then
+        breakable[brInput.Text]=true
+        saveBreakables()
+        brInput.Text=""
+        statusLabel.Text="Added breakable."
+    end
+end)
+
+local pbInput = pillInput(blocksPage, UDim2.new(0,230,0,44), UDim2.new(0,16,0,68), "Enter new place block...")
+local pbAdd   = pillButton(blocksPage, UDim2.new(0,160,0,44), UDim2.new(0,262,0,68), "Add Place Block")
+pbAdd.MouseButton1Click:Connect(function()
+    if pbInput.Text~="" then
+        table.insert(placeBlockList, pbInput.Text)
+        savePlaceBlockList()
+        pbInput.Text=""
+        statusLabel.Text="Added place block."
+    end
+end)
+
+local dropdownToggle = pillButton(blocksPage, UDim2.new(1,-32,0,44), UDim2.new(0,16,0,122), "Select Place Block ▼")
+local dropdownHolder = Instance.new("Frame")
+dropdownHolder.BackgroundTransparency = 1
+dropdownHolder.Size = UDim2.new(1,-32,0,0)
+dropdownHolder.Position = UDim2.new(0,16,0,176)
+dropdownHolder.ClipsDescendants = true
+dropdownHolder.Parent = blocksPage
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.BackgroundTransparency = 1
+scroll.Size = UDim2.new(1,0,0,150)
+scroll.Position = UDim2.new(0,0,0,0)
+scroll.CanvasSize = UDim2.new(0,0,0,0)
+scroll.ScrollBarThickness = 6
+scroll.Visible = false
+scroll.Parent = dropdownHolder
+
+local function makeListButton(parent,y,label)
+    local b = Instance.new("TextButton")
+    b.Text = label
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 16
+    b.TextColor3 = Color3.fromRGB(235,235,240)
+    b.BackgroundColor3 = Color3.fromRGB(70,70,75)
+    b.BorderSizePixel = 0
+    b.Size = UDim2.new(1, 0, 0, 44)
+    b.Position = UDim2.new(0, 0, 0, y)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,10)
+    b.Parent = parent
+    return b
+end
+
+local function refreshDropdown()
+    for _,c in ipairs(scroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local y = 0
+    for _,name in ipairs(placeBlockList) do
+        local btn = makeListButton(scroll, y, name)
+        btn.MouseButton1Click:Connect(function()
+            PLACE_BLOCK = name
+            savePlaceBlock()
+            statusLabel.Text = "Selected: "..name
+            scroll.Visible = false
+            dropdownHolder.Size = UDim2.new(1,-32,0,0)
+            dropdownToggle.Text = "Select Place Block ▼"
+        end)
+        y = y + 50
+    end
+    scroll.CanvasSize = UDim2.new(0,0,0,y)
+end
+refreshDropdown()
+
+local expanded = false
+dropdownToggle.MouseButton1Click:Connect(function()
+    expanded = not expanded
+    if expanded then
+        refreshDropdown()
+        scroll.Visible = true
+        dropdownHolder.Size = UDim2.new(1,-32,0,150)
+        dropdownToggle.Text = "Select Place Block ▲"
+    else
+        scroll.Visible = false
+        dropdownHolder.Size = UDim2.new(1,-32,0,0)
+        dropdownToggle.Text = "Select Place Block ▼"
+    end
+end)
+
+-- === SETTINGS PAGE ===
+local destroyBtn = pill(settingsPage, 16, "Destroy GUI")
+destroyBtn.MouseButton1Click:Connect(function()
+    gui:Destroy()
+    farming=false
+    placing=false
+    collecting=false
+    harvesting=false
+end)
+
+-- WalkSpeed Label
+local wsLabel = Instance.new("TextLabel")
+wsLabel.Size = UDim2.new(1,-32,0,20)
+wsLabel.Position = UDim2.new(0,16,0,70)
+wsLabel.BackgroundTransparency = 1
+wsLabel.Font = Enum.Font.Gotham
+wsLabel.TextSize = 16
+wsLabel.TextColor3 = Color3.fromRGB(235,235,240)
+wsLabel.Text = "WalkSpeed: "..walkSpeed
+wsLabel.Parent = settingsPage
+
+-- WalkSpeed Slider
+local sliderBg = Instance.new("Frame")
+sliderBg.Size = UDim2.new(1,-32,0,20)
+sliderBg.Position = UDim2.new(0,16,0,100)
+sliderBg.BackgroundColor3 = Color3.fromRGB(50,50,55)
+sliderBg.BorderSizePixel=0
+Instance.new("UICorner",sliderBg).CornerRadius=UDim.new(0,10)
+sliderBg.Parent=settingsPage
+
+local sliderFill = Instance.new("Frame")
+sliderFill.Size = UDim2.new((walkSpeed-10)/90,0,1,0)
+sliderFill.BackgroundColor3 = Color3.fromRGB(60,180,90)
+sliderFill.BorderSizePixel=0
+Instance.new("UICorner",sliderFill).CornerRadius=UDim.new(0,10)
+sliderFill.Parent=sliderBg
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.new(0,16,1,0)
+knob.Position = UDim2.new((walkSpeed-10)/90, -8, 0, 0)
+knob.BackgroundColor3 = Color3.fromRGB(235,235,240)
+knob.BorderSizePixel=0
+Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
+knob.Parent=sliderBg
+
+
+-- === SETTINGS TAB: DROP ITEM UI ===
+local dropPill = pill(settingsPage, 140, "") 
+dropPill.Size = UDim2.new(1, -32, 0, 52) -- 👈 taller than default
+dropPill.Text = "" 
+dropPill.AutoButtonColor = false 
+dropPill.ClipsDescendants = false
+
+local dropInput = pillInput(
+    dropPill,
+    UDim2.new(0, 200, 0, 36), -- smaller height
+    UDim2.new(0, 10, 0, 8),
+    "Enter item to drop..."
+)
+
+local amountInput = pillInput(
+    dropPill,
+    UDim2.new(0, 80, 0, 36),
+    UDim2.new(0, 220, 0, 8),
+    "Amount"
+)
+
+local dropBtn = pillButton(
+    dropPill,
+    UDim2.new(0, 120, 0, 36),
+    UDim2.new(0, 310, 0, 8),
+    "Drop Item"
+)
+-- Auto Drop button
+local autoDropBtn = pillButton(
+    dropPill,
+    UDim2.new(0, 120, 0, 36),
+    UDim2.new(0, 440, 0, 8), -- positioned right of Drop Item
+    "Auto Drop: OFF"
+)
+
+
+dropBtn.MouseButton1Click:Connect(function()
+    local name = dropInput.Text
+    local amountText = amountInput.Text
+    local amount = tonumber(amountText)
+
+    if name == "" then
+        statusLabel.Text = "⚠️ Enter item name first"
+        return
+    end
+    if not amount or amount <= 0 then
+        statusLabel.Text = "⚠️ Wrong amount"
+        return
+    end
+
+    dropItemByName(name, amount)
+end)
+
+-- Auto Drop button (next to Drop Item, keeps layout)
+local autoDropBtn = pillButton(
+    dropPill,
+    UDim2.new(0, 120, 0, 36),
+    UDim2.new(0, 440, 0, 8), -- right of Drop Item
+    "Auto Drop: OFF"
+)
+
+
+-- Toggle logic
+autoDropBtn.MouseButton1Click:Connect(function()
+    autoDropping = not autoDropping
+    if autoDropping then
+        autoDropBtn.Text = "Auto Drop: ON"
+
+
+
+        autoDropTask = task.spawn(function()
+            while autoDropping do
+                local name = dropInput.Text
+                local amountText = amountInput.Text
+                local amount = tonumber(amountText)
+
+                if name ~= "" and amount and amount > 0 then
+                    dropItemByName(name, amount)
+                else
+                    statusLabel.Text = "⚠️ Enter valid item + amount"
+                end
+                task.wait(5)
+            end
+        end)
+    else
+        autoDropBtn.Text = "Auto Drop: OFF"
+        autoDropBtn.BackgroundColor3 = Color3.fromRGB(70,70,75)
+        if autoDropTask then
+            task.cancel(autoDropTask)
+            autoDropTask = nil
+        end
+    end
+end)
+
+
+
+
+
+
+
+local draggingSlider = false
+sliderBg.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then draggingSlider = true end
+end)
+UIS.InputEnded:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and draggingSlider then
+        draggingSlider = false; saveWalkSpeed()
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local relX = math.clamp((input.Position.X - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X,0,1)
+        local newValue = math.floor(10 + relX*90 + 0.5)
+        walkSpeed = newValue
+        wsLabel.Text = "WalkSpeed: "..walkSpeed
+        sliderFill.Size = UDim2.new(relX,0,1,0)
+        knob.Position = UDim2.new(relX,-8,0,0)
+        local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid.WalkSpeed = walkSpeed end
+    end
+end)
+
+-- Apply initial WalkSpeed now and on respawn
+task.spawn(function()
+    local char = player.Character or player.CharacterAdded:Wait()
+    local hum = char:WaitForChild("Humanoid")
+    hum.WalkSpeed = walkSpeed
+    player.CharacterAdded:Connect(function(c2)
+        local h2 = c2:WaitForChild("Humanoid")
+        h2.WalkSpeed = walkSpeed
+    end)
+end)
+
+-- === SETTINGS TAB: MOD DETECTION UI (dropdown-like) ===
+local modDetectToggle = pill(settingsPage, 200, "Mod Detection: OFF")
+-- keep as button
+modDetectToggle.MouseButton1Click:Connect(function()
+    modDetectionEnabled = not modDetectionEnabled
+    modDetectToggle.BackgroundColor3 = modDetectionEnabled and Color3.fromRGB(200,50,50) or Color3.fromRGB(70,70,75)
+    modDetectToggle.Text = modDetectionEnabled and "Mod Detection: ON" or "Mod Detection: OFF"
+    if modDetectionEnabled then
+        statusLabel.Text = "👀 Mod scan active"
+        rescanPlayersForMods()
+    else
+        statusLabel.Text = "Mod scan disabled"
+    end
+end)
+
+local modInput = pillInput(settingsPage, UDim2.new(0,230,0,36), UDim2.new(0,16,0,254), "Enter mod username...")
+local modAddBtn = pillButton(settingsPage, UDim2.new(0,160,0,36), UDim2.new(0,262,0,254), "Add/Remove")
+
+-- === SETTINGS TAB: MOD WATCHLIST DROPDOWN ===
+local modDropdownToggle = pillButton(settingsPage, UDim2.new(1,-32,0,44), UDim2.new(0,16,0,300), "Show Watchlist ▼")
+
+local modDropdownHolder = Instance.new("Frame")
+modDropdownHolder.BackgroundTransparency = 1
+modDropdownHolder.Size = UDim2.new(1,-32,0,0) -- collapsed by default
+modDropdownHolder.Position = UDim2.new(0,16,0,354) -- place right below toggle
+modDropdownHolder.ClipsDescendants = true
+modDropdownHolder.Parent = settingsPage
+
+local modScroll = Instance.new("ScrollingFrame")
+modScroll.BackgroundTransparency = 1
+modScroll.Size = UDim2.new(1,0,0,150)
+modScroll.Position = UDim2.new(0,0,0,0)
+modScroll.CanvasSize = UDim2.new(0,0,0,0)
+modScroll.ScrollBarThickness = 6
+modScroll.Visible = false
+modScroll.Parent = modDropdownHolder
+
+-- Button factory (reuse from blocks)
+local function makeListButton(parent,y,label)
+    local b = Instance.new("TextButton")
+    b.Text = label
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 16
+    b.TextColor3 = Color3.fromRGB(235,235,240)
+    b.BackgroundColor3 = Color3.fromRGB(70,70,75)
+    b.BorderSizePixel = 0
+    b.Size = UDim2.new(1, 0, 0, 44)
+    b.Position = UDim2.new(0, 0, 0, y)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,10)
+    b.Parent = parent
+    return b
+end
+
+local function refreshWatchlist()
+    for _,c in ipairs(modScroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local y = 0
+    for name,_ in pairs(knownMods) do
+        local btn = makeListButton(modScroll, y, name)
+        btn.MouseButton1Click:Connect(function()
+            knownMods[name] = nil
+            saveMods()
+            statusLabel.Text = "Removed mod: "..name
+            refreshWatchlist()
+        end)
+        y = y + 50
+    end
+    modScroll.CanvasSize = UDim2.new(0,0,0,y)
+
+    -- 👇 auto-shrink/expand holder (max 150px like before)
+    local holderHeight = math.min(y, 150)
+    modDropdownHolder.Size = UDim2.new(1,-32,0,holderHeight)
+end
+
+
+refreshWatchlist()
+
+-- Toggle expand/collapse
+local modExpanded = false
+modDropdownToggle.MouseButton1Click:Connect(function()
+    modExpanded = not modExpanded
+    if modExpanded then
+        refreshWatchlist()
+        modScroll.Visible = true
+        modDropdownHolder.Size = UDim2.new(1,-32,0,100)
+        modDropdownToggle.Text = "Show Watchlist ▲"
+    else
+        modScroll.Visible = false
+        modDropdownHolder.Size = UDim2.new(1,-32,0,100)
+        modDropdownToggle.Text = "Show Watchlist ▼"
+    end
+end)
+
+modAddBtn.MouseButton1Click:Connect(function()
+    local name = (modInput.Text or ""):gsub("^%s+",""):gsub("%s+$","")
+    if name ~= "" then
+        if knownMods[name] then
+            knownMods[name] = nil
+            statusLabel.Text = "Removed mod: "..name
+        else
+            knownMods[name] = true
+            statusLabel.Text = "Added mod: "..name
+        end
+        saveMods()
+        modInput.Text = ""
+
+        -- Always refresh list
+        refreshWatchlist()
+
+        -- 👇 If dropdown is expanded, keep it visible and resized
+        if modExpanded then
+            modScroll.Visible = true
+            modDropdownHolder.Size = UDim2.new(1,-32,0,150)
+            modDropdownToggle.Text = "Show Watchlist ▲"
+        end
+    end
+end)
+
+
+-- === DRAGGABLE (PC + Mobile) ===
+do
+    local dragging = false
+    local dragInput, dragStart, startPos
+
+    local function update(input)
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+
+    local function beginDrag(input)
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            beginDrag(input)
+        end
+    end)
+    titleBar.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            update(input)
+        end
+    end)
+end
+
+-- Minimize logic
+local minimized = false
+minimizeBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        content.Visible = false
+        sidebar.Visible = false
+        mainFrame.Size = UDim2.new(0,200,0,42)
+        minimizeBtn.Text = "+"
+    else
+        content.Visible = true
+        sidebar.Visible = true
+        mainFrame.Size = UDim2.new(0,600,0,500)
+        minimizeBtn.Text = "–"
+    end
+end)
+
+-- === RESIZABLE (bottom-right handle) ===
+do
+    local resizeHandle = Instance.new("Frame")
+    resizeHandle.Name = "ResizeHandle"
+    resizeHandle.Size = UDim2.new(0,18,0,18)
+    resizeHandle.Position = UDim2.new(1,-18,1,-18)
+    resizeHandle.BackgroundColor3 = Color3.fromRGB(60,60,65)
+    resizeHandle.BorderSizePixel=0
+    resizeHandle.ZIndex=100
+    resizeHandle.Parent=mainFrame
+    local corner=Instance.new("UICorner")
+    corner.CornerRadius=UDim.new(0,4)
+    corner.Parent=resizeHandle
+
+    local resizing=false
+    local resizeStart,frameStartSize
+    resizeHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            resizing=true
+            resizeStart=input.Position
+            frameStartSize=mainFrame.Size
+            input.Changed:Connect(function()
+                if input.UserInputState==Enum.UserInputState.End then resizing=false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if resizing and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+            local delta=input.Position-resizeStart
+            mainFrame.Size=UDim2.new(frameStartSize.X.Scale,math.clamp(frameStartSize.X.Offset+delta.X,360,1100),
+                                     frameStartSize.Y.Scale,math.clamp(frameStartSize.Y.Offset+delta.Y,280,900))
+        end
+    end)
+end
+
+-- Default Page (show main tab on load)
+showPage("Main")
+
+-- Toggle GUI with RightShift (PC)
+UIS.InputBegan:Connect(function(input,gp)
+    if gp then return end
+    if input.KeyCode==Enum.KeyCode.RightShift then
+        gui.Enabled=not gui.Enabled
+    end
+end)
+
+-- Optional: silence RS voice chat warning
+pcall(function()
+    if RS:FindFirstChild("SendLikelySpeakingUsers") then
+        RS.SendLikelySpeakingUsers.OnClientEvent:Connect(function() end)
+    end
+end)
+
+print("✅ Tqcticals Hub Hub loaded (mobile safe)")
