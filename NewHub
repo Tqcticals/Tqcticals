@@ -24,12 +24,13 @@ local PLACE_FILE       = "BlocktopiaPlaceBlock.txt"
 local PLACE_LIST_FILE  = "BlocktopiaPlaceBlocks.json"
 local WALKSPEED_FILE   = "BlocktopiaWalkSpeed.txt"
 local MODS_FILE        = "BlocktopiaMods.json"
+local FIXED_POS = nil -- will store Vector3
 
 -- === Settings ===
 local PLACE_BLOCK = "Red Block"
 local LOOP_DELAY  = 0
 local PLACE_DELAY = 0.3
-local MAX_RANGE   = 5
+local MAX_RANGE   = 10
 local DEFAULT_WALKSPEED = 21
 local walkSpeed = DEFAULT_WALKSPEED
 
@@ -105,11 +106,24 @@ local function rayModel(dir)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Blacklist
     params.FilterDescendantsInstances = {player.Character}
-    local r = Workspace:Raycast(hrp.Position, dir * 4, params)
-    if not r then return nil end
-    local model = r.Instance:FindFirstAncestorOfClass("Model")
-    return model or r.Instance
+
+    -- make the raycast distance match block size (usually 1 or 2 studs)
+    local rayDistance = 5
+
+    local result = Workspace:Raycast(hrp.Position, dir * rayDistance, params)
+    if not result then return nil end
+
+    -- Find the top-level model
+    local model = result.Instance:FindFirstAncestorOfClass("Model") or result.Instance
+
+    -- Ignore air and anything without a name in your breakable list
+    if model and model.Name ~= "Air" and breakable[model.Name] then
+        return model
+    end
+    return nil
 end
+
+
 
 -- === FARM LOOP (mobile safe) ===
 local function startFarming()
@@ -140,25 +154,36 @@ local function stopFarming()
     statusLabel.Text="Ready"
 end
 
--- === PLACE HELPERS ===
+-- === PLACE HELPERS (DEBUG) ===
 local function placeBlockAt(pos)
     if LastSelectedItem then
         pcall(function() LastSelectedItem.Value = PLACE_BLOCK end)
     end
+
     local best, bestDist = nil, math.huge
     for _, m in ipairs(Workspace:GetDescendants()) do
         if m:IsA("Model") and m.Name == "Air" then
             local p = m:FindFirstChild("SavePositionPart") or m:FindFirstChildWhichIsA("BasePart")
             if p then
                 local d = (p.Position - pos).Magnitude
-                if d < bestDist and d < 6 then
+                if d < bestDist and d < 3 then
                     best, bestDist = m, d
                 end
             end
         end
     end
-    if best then pcall(function() callServer(RequestPlaceBlock, best, PLACE_BLOCK) end) end
+
+    if best then
+        print("📦 [AutoPlace] Chose Air block:", best:GetFullName(),
+              " at ", best:FindFirstChildWhichIsA("BasePart").Position,
+              " | Target was:", pos)
+        pcall(function() callServer(RequestPlaceBlock, best, PLACE_BLOCK) end)
+    else
+        print("⚠️ [AutoPlace] No Air found near target:", pos)
+    end
 end
+
+
 
 -- === Wait for nearby drops (shortened + mobile safe) ===
 local function waitUntilCollected(timeout)
@@ -210,7 +235,9 @@ local function waitUntilCollected(timeout)
     return true
 end
 
--- === PLACE LOOP (mobile safe) ===
+
+
+-- === PLACE LOOP (ray + nearest Air) ===
 local function startPlacing()
     if placingTask then return end
     placing = true
@@ -218,13 +245,48 @@ local function startPlacing()
     placingTask = task.spawn(function()
         while placing do
             local hrp = getHRP()
-            local target = hrp.Position + (hrp.CFrame.LookVector * 4) + Vector3.new(0, -2, 0)
-            waitUntilCollected(1) -- shortened from 5s
-            placeBlockAt(target)
-            task.wait(math.max(PLACE_DELAY, 0.1))
+            if not hrp then break end
+
+            -- Get a target position in front of the player (ray for direction)
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Blacklist
+            params.FilterDescendantsInstances = {player.Character}
+
+            local rayDistance = 3
+            local result = Workspace:Raycast(hrp.Position, hrp.CFrame.LookVector * rayDistance, params)
+            local targetPos = result and result.Position or (hrp.Position + hrp.CFrame.LookVector * rayDistance)
+
+            print("🎯 [AutoPlace] Target position:", targetPos)
+
+            -- Find nearest Air model to that position
+            local best, bestDist
+            for _, m in ipairs(Workspace:GetDescendants()) do
+                if m:IsA("Model") and m.Name == "Air" then
+                    local p = m:FindFirstChild("SavePositionPart") or m:FindFirstChildWhichIsA("BasePart")
+                    if p then
+                        local dist = (p.Position - targetPos).Magnitude
+                        if not bestDist or dist < bestDist then
+                            best, bestDist = m, dist
+                        end
+                    end
+                end
+            end
+
+            if best then
+                print("📦 [AutoPlace] Chose Air at", best:GetFullName(), "distance:", bestDist)
+                waitUntilCollected(0.5)
+                pcall(function()
+                    callServer(RequestPlaceBlock, best, PLACE_BLOCK)
+                end)
+            else
+                print("⚠️ [AutoPlace] No Air near target")
+            end
+
+            task.wait(math.max(PLACE_DELAY, 0))
         end
     end)
 end
+
 local function stopPlacing()
     placing=false
     placingTask=nil
@@ -651,28 +713,59 @@ end)
 
 
 -- === BLOCKS PAGE ===
+-- Breakables
 local brInput = pillInput(blocksPage, UDim2.new(0,230,0,44), UDim2.new(0,16,0,14), "Enter breakable name...")
-local brAdd   = pillButton(blocksPage, UDim2.new(0,160,0,44), UDim2.new(0,262,0,14), "Add Breakable")
+local brAdd   = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,262,0,14), "Add Breakable")
+local brRemove = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,392,0,14), "Remove Breakable")
+
 brAdd.MouseButton1Click:Connect(function()
-    if brInput.Text~="" then
-        breakable[brInput.Text]=true
+    if brInput.Text ~= "" then
+        breakable[brInput.Text] = true
         saveBreakables()
-        brInput.Text=""
-        statusLabel.Text="Added breakable."
+        brInput.Text = ""
+        statusLabel.Text = "✅ Added breakable."
     end
 end)
 
+brRemove.MouseButton1Click:Connect(function()
+    if brInput.Text ~= "" and breakable[brInput.Text] then
+        breakable[brInput.Text] = nil
+        saveBreakables()
+        brInput.Text = ""
+        statusLabel.Text = "🗑️ Removed breakable."
+    end
+end)
+
+-- Place Blocks
 local pbInput = pillInput(blocksPage, UDim2.new(0,230,0,44), UDim2.new(0,16,0,68), "Enter new place block...")
-local pbAdd   = pillButton(blocksPage, UDim2.new(0,160,0,44), UDim2.new(0,262,0,68), "Add Place Block")
+local pbAdd   = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,262,0,68), "Add Place Block")
+local pbRemove = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,392,0,68), "Remove Place Block")
+
 pbAdd.MouseButton1Click:Connect(function()
-    if pbInput.Text~="" then
+    if pbInput.Text ~= "" then
         table.insert(placeBlockList, pbInput.Text)
         savePlaceBlockList()
-        pbInput.Text=""
-        statusLabel.Text="Added place block."
+        pbInput.Text = ""
+        statusLabel.Text = "✅ Added place block."
     end
 end)
 
+pbRemove.MouseButton1Click:Connect(function()
+    if pbInput.Text ~= "" then
+        for i, v in ipairs(placeBlockList) do
+            if v == pbInput.Text then
+                table.remove(placeBlockList, i)
+                savePlaceBlockList()
+                pbInput.Text = ""
+                statusLabel.Text = "🗑️ Removed place block."
+                return
+            end
+        end
+        statusLabel.Text = "⚠️ Block not found in list."
+    end
+end)
+
+-- Dropdown for selecting place block
 local dropdownToggle = pillButton(blocksPage, UDim2.new(1,-32,0,44), UDim2.new(0,16,0,122), "Select Place Block ▼")
 local dropdownHolder = Instance.new("Frame")
 dropdownHolder.BackgroundTransparency = 1
@@ -715,7 +808,7 @@ local function refreshDropdown()
         btn.MouseButton1Click:Connect(function()
             PLACE_BLOCK = name
             savePlaceBlock()
-            statusLabel.Text = "Selected: "..name
+            statusLabel.Text = "📌 Selected: "..name
             scroll.Visible = false
             dropdownHolder.Size = UDim2.new(1,-32,0,0)
             dropdownToggle.Text = "Select Place Block ▼"
@@ -740,6 +833,60 @@ dropdownToggle.MouseButton1Click:Connect(function()
         dropdownToggle.Text = "Select Place Block ▼"
     end
 end)
+
+-- === BREAKABLES LIST (scrollable) ===
+local brDropdownToggle = pillButton(blocksPage, UDim2.new(1,-32,0,44), UDim2.new(0,16,0,340), "Show Breakables ▼")
+
+local brDropdownHolder = Instance.new("Frame")
+brDropdownHolder.BackgroundTransparency = 1
+brDropdownHolder.Size = UDim2.new(1,-32,0,0)
+brDropdownHolder.Position = UDim2.new(0,16,0,400)
+brDropdownHolder.ClipsDescendants = true
+brDropdownHolder.Parent = blocksPage
+
+local brScroll = Instance.new("ScrollingFrame")
+brScroll.BackgroundTransparency = 1
+brScroll.Size = UDim2.new(1,0,0,150)
+brScroll.Position = UDim2.new(0,0,0,0)
+brScroll.CanvasSize = UDim2.new(0,0,0,0)
+brScroll.ScrollBarThickness = 6
+brScroll.Visible = false
+brScroll.Parent = brDropdownHolder
+
+local function refreshBreakableList()
+    for _,c in ipairs(brScroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local y = 0
+    for name,_ in pairs(breakable) do
+        local btn = makeListButton(brScroll, y, name)
+        btn.MouseButton1Click:Connect(function()
+            breakable[name] = nil
+            saveBreakables()
+            statusLabel.Text = "🗑️ Removed breakable: " .. name
+            refreshBreakableList()
+        end)
+        y = y + 50
+    end
+    brScroll.CanvasSize = UDim2.new(0,0,0,y)
+end
+refreshBreakableList()
+
+local brExpanded = false
+brDropdownToggle.MouseButton1Click:Connect(function()
+    brExpanded = not brExpanded
+    if brExpanded then
+        refreshBreakableList()
+        brScroll.Visible = true
+        brDropdownHolder.Size = UDim2.new(1,-32,0,150)
+        brDropdownToggle.Text = "Show Breakables ▲"
+    else
+        brScroll.Visible = false
+        brDropdownHolder.Size = UDim2.new(1,-32,0,0)
+        brDropdownToggle.Text = "Show Breakables ▼"
+    end
+end)
+
 
 -- === SETTINGS PAGE ===
 local destroyBtn = pill(settingsPage, 16, "Destroy GUI")
