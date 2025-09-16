@@ -174,15 +174,11 @@ local function placeBlockAt(pos)
     end
 
     if best then
-        print("📦 [AutoPlace] Chose Air block:", best:GetFullName(),
-              " at ", best:FindFirstChildWhichIsA("BasePart").Position,
-              " | Target was:", pos)
-        pcall(function() callServer(RequestPlaceBlock, best, PLACE_BLOCK) end)
-    else
-        print("⚠️ [AutoPlace] No Air found near target:", pos)
+        pcall(function()
+            callServer(RequestPlaceBlock, best, PLACE_BLOCK)
+        end)
     end
 end
-
 
 
 -- === Wait for nearby drops (shortened + mobile safe) ===
@@ -256,7 +252,7 @@ local function startPlacing()
             local result = Workspace:Raycast(hrp.Position, hrp.CFrame.LookVector * rayDistance, params)
             local targetPos = result and result.Position or (hrp.Position + hrp.CFrame.LookVector * rayDistance)
 
-            print("🎯 [AutoPlace] Target position:", targetPos)
+            
 
             -- Find nearest Air model to that position
             local best, bestDist
@@ -273,7 +269,6 @@ local function startPlacing()
             end
 
             if best then
-                print("📦 [AutoPlace] Chose Air at", best:GetFullName(), "distance:", bestDist)
                 waitUntilCollected(0.5)
                 pcall(function()
                     callServer(RequestPlaceBlock, best, PLACE_BLOCK)
