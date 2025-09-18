@@ -314,7 +314,7 @@ local function startCollecting()
     collectorTask = task.spawn(function()
         while collecting do
             sweepCollect()
-            task.wait(0.1) -- was 0.02
+            task.wait(0.02) -- was 0.02
         end
     end)
 end
@@ -506,6 +506,54 @@ local function dropItemByName(itemName, amount)
     end
 end
 
+-- === GROW SCANNER LOGIC ===
+local scanTargets = {
+    ["Tree"] = true,
+    ["Lava"] = true,
+    ["Stone"] = true,
+    ["Grass"] = true,
+}
+
+
+    local function runScan()
+    local counts = {}
+
+    -- === Placed blocks ===
+    local worldBlocks = Workspace:FindFirstChild("WorldBlocks")
+    if worldBlocks then
+        for _, block in ipairs(worldBlocks:GetChildren()) do
+            if block.Name:lower():find("seed") then
+                counts[block.Name] = (counts[block.Name] or 0) + 1
+            end
+        end
+    end
+
+    -- === Dropped seeds ===
+    local floating = Workspace:FindFirstChild("FloatingObjects")
+    if floating then
+        for _, drop in ipairs(floating:GetChildren()) do
+            local itemName
+
+            -- Try to read the real item name
+            local nameValue = drop:FindFirstChild("ItemName") or drop:FindFirstChildWhichIsA("StringValue")
+            if nameValue then
+                itemName = nameValue.Value
+            else
+                itemName = drop.Name
+            end
+
+            -- Only count seeds
+            if itemName:lower():find("seed") then
+                counts[itemName] = (counts[itemName] or 0) + 1
+            end
+        end
+    end
+
+    return counts
+end
+
+
+
 
 
 
@@ -585,6 +633,7 @@ end
 local mainPage=createPage("Main")
 local blocksPage=createPage("Blocks")
 local settingsPage=createPage("Settings")
+local scannerPage=createPage("Scanner")
 settingsPage.ClipsDescendants = true
 
 -- Tabs
@@ -600,6 +649,7 @@ end
 tab("rbxassetid://6031094678",1,"Main")
 tab("rbxassetid://6031265976",2,"Blocks")
 tab("rbxassetid://6031094679",3,"Settings")
+tab("rbxassetid://6034509993",4,"Scanner") -- magnifying glass icon
 
 -- Pill helpers
 local function pill(parent,y,text)
@@ -735,6 +785,33 @@ end)
 local pbInput = pillInput(blocksPage, UDim2.new(0,230,0,44), UDim2.new(0,16,0,68), "Enter new place block...")
 local pbAdd   = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,262,0,68), "Add Place Block")
 local pbRemove = pillButton(blocksPage, UDim2.new(0,120,0,44), UDim2.new(0,392,0,68), "Remove Place Block")
+-- === SCANNER PAGE ===
+local scanBtn = pill(scannerPage, 14, "🔍 Run Scan")
+
+local resultsBox = Instance.new("TextLabel")
+resultsBox.Size = UDim2.new(1,-32,1,-80)
+resultsBox.Position = UDim2.new(0,16,0,70)
+resultsBox.BackgroundColor3 = Color3.fromRGB(30,30,35)
+resultsBox.TextColor3 = Color3.fromRGB(235,235,240)
+resultsBox.Font = Enum.Font.Gotham
+resultsBox.TextSize = 16
+resultsBox.TextXAlignment = Enum.TextXAlignment.Left
+resultsBox.TextYAlignment = Enum.TextYAlignment.Top
+resultsBox.TextWrapped = true
+resultsBox.Text = "Scanner results will appear here..."
+resultsBox.Parent = scannerPage
+Instance.new("UICorner", resultsBox).CornerRadius = UDim.new(0,10)
+
+scanBtn.MouseButton1Click:Connect(function()
+    local counts = runScan()
+    local output = "🔍 Grow Scanner Results:\n\n"
+    for name,count in pairs(counts) do
+        output ..= name..": "..count.."\n"
+    end
+    resultsBox.Text = output
+    statusLabel.Text = "✅ Scan complete"
+end)
+
 
 pbAdd.MouseButton1Click:Connect(function()
     if pbInput.Text ~= "" then
@@ -1291,4 +1368,4 @@ pcall(function()
     end
 end)
 
-print("✅ Tqcticals Hub Hub loaded (mobile safe)")
+print("✅ Tqcticals Hub Hub loaded ")
